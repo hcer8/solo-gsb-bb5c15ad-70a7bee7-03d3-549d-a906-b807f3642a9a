@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
+from typing import Literal
 
 from fastapi import Body, FastAPI
 from fastapi.responses import RedirectResponse
@@ -13,6 +15,7 @@ from .image_merge import MergeSource, merge_images
 from .layout import Region, validate_layout
 from .relocation import plan_relocation
 from .flash_update import plan_flash_update
+from .flash_verify import ReplayOperation, verify_flash_operations
 from .vector_table import VectorRegion, validate_vector_table
 
 app = FastAPI(
@@ -28,8 +31,9 @@ app = FastAPI(
         "occupancy and utilization), relocated as a whole by one integer "
         "delta whose feasible range is computed against those regions, "
         "diffed against another image to plan NOR-flash erase/write steps, "
-        "or read as a Cortex-M vector table checked against ram/executable "
-        "memory regions."
+        "checked against a caller-supplied erase/write sequence replayed "
+        "under NOR-flash semantics, or read as a Cortex-M vector table "
+        "checked against ram/executable memory regions."
     ),
 )
 
@@ -352,6 +356,142 @@ class PlanFlashUpdateResponse(BaseModel):
     zero_to_one_bytes: int = Field(
         ..., description="Changed addresses requiring erase (any 0 -> 1 bit transition)"
     )
+
+
+class VerifyOperationIn(BaseModel):
+    kind: Literal["erase", "write"] = Field(..., description="Operation kind")
+    address: int = Field(..., ge=0, description="Operation start address")
+    size: int | None = Field(
+        None, ge=1, description="Erase: bytes to erase (multiple of erase_block_size); "
+        "write: optional, must match the decoded data_base64 length when given"
+    )
+    data_base64: str | None = Field(
+        None, description="Write: Base64 bytes to program; forbidden for erase"
+    )
+
+    @model_validator(mode="after")
+    def _check_kind_fields(self) -> VerifyOperationIn:
+        if self.kind == "erase":
+            if self.size is None:
+                raise ValueError("erase operations require 'size'")
+            if self.data_base64 is not None:
+                raise ValueError("erase operations must not carry 'data_base64'")
+        else:
+            if self.data_base64 is None:
+                raise ValueError("write operations require 'data_base64'")
+            try:
+                data = base64.b64decode(self.data_base64, validate=True)
+            except (binascii.Error, ValueError):
+                raise ValueError("data_base64 is not valid Base64") from None
+            if self.size is not None and self.size != len(data):
+                raise ValueError(
+                    f"size {self.size} does not match the decoded data_base64 "
+                    f"length {len(data)}"
+                )
+        return self
+
+
+class VerifyFlashOperationsRequest(BaseModel):
+    current_hex: str = Field(..., description="Intel HEX text of the image currently in flash")
+    target_hex: str = Field(..., description="Intel HEX text of the image to reach")
+    flash_start: int = Field(..., ge=0, description="Inclusive start of the flash window")
+    flash_end: int = Field(..., ge=0, description="Exclusive end of the flash window")
+    erase_block_size: int = Field(
+        ..., ge=1, description="Uniform erase-sector size in bytes; flash_start/end must align to it"
+    )
+    max_write_size: int = Field(
+        ..., ge=1, description="Maximum bytes per write; writes never cross an erase block"
+    )
+    operations: list[VerifyOperationIn] = Field(
+        ..., description="Ordered erase/write steps to replay; may be empty"
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "current_hex": ":10000000000102030405060708090A0B0C0D0E0F78\n:00000001FF\n",
+                    "target_hex": ":10000000FF0102030405060708090A0B0C0D0E0F79\n:00000001FF\n",
+                    "flash_start": 0,
+                    "flash_end": 256,
+                    "erase_block_size": 64,
+                    "max_write_size": 16,
+                    "operations": [
+                        {"kind": "erase", "address": 0, "size": 64},
+                        {"kind": "write", "address": 1, "data_base64": "AQIDBAUGBwgJCgsMDQ4P"},
+                    ],
+                }
+            ]
+        }
+    }
+
+
+class OperationErrorOut(BaseModel):
+    index: int = Field(..., description="0-based position of the first illegal operation")
+    kind: str = Field(
+        ...,
+        description="erase_unaligned | erase_outside_flash | empty_write | "
+        "write_outside_flash | write_crosses_block | write_too_large | zero_to_one_write",
+    )
+    message: str
+    address: int | None = Field(None, description="First affected address, if applicable")
+    end: int | None = Field(None, description="Exclusive end of the affected range, if applicable")
+
+
+class DiffRangeOut(BaseModel):
+    start: int = Field(..., description="First differing address of the contiguous run")
+    end: int = Field(..., description="Exclusive end address of the run")
+    size: int = Field(..., description="Number of differing bytes in the run")
+    expected_base64: str = Field(
+        ..., description="Target image bytes over the run (0xFF where undefined)"
+    )
+    actual_base64: str = Field(
+        ..., description="Replayed flash bytes over the run (0xFF where undefined)"
+    )
+
+
+class VerifyFlashOperationsResponse(BaseModel):
+    ok: bool = Field(
+        ...,
+        description="True when the images, parameters and every operation are valid and the "
+        "replayed flash matches the target image exactly (zero differing bytes)",
+    )
+    current_hex_ok: bool = Field(..., description="True when current_hex passed validation")
+    target_hex_ok: bool = Field(..., description="True when target_hex passed validation")
+    params_valid: bool | None = Field(
+        ...,
+        description="True when the flash window/alignment parameters and image placement are "
+        "valid; null when the parameter check did not run (either HEX invalid)",
+    )
+    operations_valid: bool | None = Field(
+        ...,
+        description="True when every operation was legal; null when the replay did not run "
+        "(invalid HEX or parameters)",
+    )
+    flash_start: int
+    flash_end: int
+    erase_block_size: int
+    max_write_size: int
+    error_count: int = Field(..., description="Error diagnostics across both HEX texts")
+    warning_count: int = Field(..., description="Warning diagnostics across both HEX texts")
+    current_diagnostics: list[DiagnosticOut]
+    target_diagnostics: list[DiagnosticOut]
+    param_errors: list[FlashParamErrorOut] = Field(
+        ..., description="Parameter-level problems; non-empty only when params_valid is false"
+    )
+    operations_total: int = Field(..., description="Number of operations supplied")
+    operations_checked: int = Field(
+        ..., description="Operations successfully replayed before stopping"
+    )
+    operation_error: OperationErrorOut | None = Field(
+        None, description="The first illegal operation; null when all operations are legal"
+    )
+    diff_ranges: list[DiffRangeOut] = Field(
+        ...,
+        description="Contiguous runs where the replayed flash differs from the target image; "
+        "empty unless every operation was legal",
+    )
+    diff_bytes: int = Field(..., description="Total differing bytes across diff_ranges")
 
 
 class VectorRegionIn(BaseModel):
@@ -907,6 +1047,110 @@ def plan_flash_update_route(request: PlanFlashUpdateRequest) -> PlanFlashUpdateR
         write_bytes=plan.write_bytes,
         changed_bytes=plan.changed_bytes,
         zero_to_one_bytes=plan.zero_to_one_bytes,
+        **base_fields,
+    )
+
+
+@app.post(
+    "/api/v1/verify-flash-operations",
+    response_model=VerifyFlashOperationsResponse,
+    tags=["flash"],
+)
+def verify_flash_operations_route(
+    request: VerifyFlashOperationsRequest,
+) -> VerifyFlashOperationsResponse:
+    """Verify an ordered erase/write sequence against the target image.
+
+    Both Intel HEX texts and the flash window parameters are validated
+    exactly as for ``/api/v1/plan-flash-update``; when either fails, the
+    corresponding diagnostics are returned and no replay runs. Otherwise
+    the operations are replayed one by one from the current image under
+    NOR-flash semantics (undefined bytes read as ``0xFF``): an erase
+    must cover whole ``erase_block_size`` blocks inside the window; a
+    write must stay inside the window and a single erase block, carry at
+    most ``max_write_size`` bytes, and cause only ``1 -> 0`` bit
+    transitions against the replayed state. The first illegal operation
+    stops the replay and is reported with its 0-based index and an error
+    code. When every operation is legal, the replayed flash is compared
+    with the target image and the differences are merged into contiguous
+    ranges; ``ok`` is true only when zero bytes differ.
+    """
+    current = parse_intel_hex(request.current_hex)
+    target = parse_intel_hex(request.target_hex)
+
+    base_fields = dict(
+        flash_start=request.flash_start,
+        flash_end=request.flash_end,
+        erase_block_size=request.erase_block_size,
+        max_write_size=request.max_write_size,
+        error_count=current.error_count + target.error_count,
+        warning_count=current.warning_count + target.warning_count,
+        current_diagnostics=[DiagnosticOut(**vars(d)) for d in current.diagnostics],
+        target_diagnostics=[DiagnosticOut(**vars(d)) for d in target.diagnostics],
+        operations_total=len(request.operations),
+    )
+
+    if not (current.ok and target.ok):
+        return VerifyFlashOperationsResponse(
+            ok=False,
+            current_hex_ok=current.ok,
+            target_hex_ok=target.ok,
+            params_valid=None,
+            operations_valid=None,
+            param_errors=[],
+            operations_checked=0,
+            operation_error=None,
+            diff_ranges=[],
+            diff_bytes=0,
+            **base_fields,
+        )
+
+    operations = [
+        ReplayOperation(
+            kind=op.kind,
+            address=op.address,
+            size=op.size if op.size is not None else 0,
+            data=(
+                base64.b64decode(op.data_base64)
+                if op.data_base64 is not None
+                else b""
+            ),
+        )
+        for op in request.operations
+    ]
+    result = verify_flash_operations(
+        current.segments,
+        target.segments,
+        request.flash_start,
+        request.flash_end,
+        request.erase_block_size,
+        request.max_write_size,
+        operations,
+    )
+    return VerifyFlashOperationsResponse(
+        ok=result.ok,
+        current_hex_ok=True,
+        target_hex_ok=True,
+        params_valid=result.params_valid,
+        operations_valid=result.operations_valid,
+        param_errors=[FlashParamErrorOut(**vars(e)) for e in result.param_errors],
+        operations_checked=result.operations_checked,
+        operation_error=(
+            None
+            if result.operation_error is None
+            else OperationErrorOut(**vars(result.operation_error))
+        ),
+        diff_ranges=[
+            DiffRangeOut(
+                start=r.start,
+                end=r.end,
+                size=len(r.expected),
+                expected_base64=base64.b64encode(r.expected).decode("ascii"),
+                actual_base64=base64.b64encode(r.actual).decode("ascii"),
+            )
+            for r in result.diff_ranges
+        ],
+        diff_bytes=result.diff_bytes,
         **base_fields,
     )
 

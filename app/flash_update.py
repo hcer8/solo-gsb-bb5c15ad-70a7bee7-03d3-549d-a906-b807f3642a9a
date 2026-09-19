@@ -106,20 +106,20 @@ def _to_map(segments: list[Segment]) -> dict[int, int]:
     return memory
 
 
-def plan_flash_update(
+def validate_flash_params(
     current_segments: list[Segment],
     target_segments: list[Segment],
     flash_start: int,
     flash_end: int,
     erase_block_size: int,
     max_write_size: int,
-) -> FlashUpdatePlan:
-    """Plan the erase/write steps that turn the current image into target.
+) -> list[ParamError]:
+    """Validate the flash window, erase-block alignment and image placement.
 
-    Flash-range and erase-block alignment parameters are validated
-    first, then both images must lie wholly inside the flash window;
-    on any problem the corresponding ``param_errors`` are returned and
-    no operations are generated.
+    An empty result means ``[flash_start, flash_end)`` is a non-empty
+    32-bit half-open interval aligned to ``erase_block_size`` and both
+    images lie wholly inside it. Range/alignment problems are reported
+    first; image placement is only checked when those hold.
     """
     errors: list[ParamError] = []
 
@@ -168,16 +168,7 @@ def plan_flash_update(
                 )
             )
     if errors:
-        return FlashUpdatePlan(
-            ok=False,
-            params_valid=False,
-            param_errors=errors,
-            blocks=[],
-            operations=[],
-        )
-
-    current = _to_map(current_segments)
-    target = _to_map(target_segments)
+        return errors
 
     for label, segments in (("current", current_segments), ("target", target_segments)):
         for seg in segments:
@@ -211,6 +202,32 @@ def plan_flash_update(
                         end=hi,
                     )
                 )
+    return errors
+
+
+def plan_flash_update(
+    current_segments: list[Segment],
+    target_segments: list[Segment],
+    flash_start: int,
+    flash_end: int,
+    erase_block_size: int,
+    max_write_size: int,
+) -> FlashUpdatePlan:
+    """Plan the erase/write steps that turn the current image into target.
+
+    Flash-range and erase-block alignment parameters are validated
+    first, then both images must lie wholly inside the flash window;
+    on any problem the corresponding ``param_errors`` are returned and
+    no operations are generated.
+    """
+    errors = validate_flash_params(
+        current_segments,
+        target_segments,
+        flash_start,
+        flash_end,
+        erase_block_size,
+        max_write_size,
+    )
     if errors:
         return FlashUpdatePlan(
             ok=False,
@@ -219,6 +236,9 @@ def plan_flash_update(
             blocks=[],
             operations=[],
         )
+
+    current = _to_map(current_segments)
+    target = _to_map(target_segments)
 
     # Compare every address defined by either image; undefined bytes
     # read as the erased value 0xFF. Addresses are visited once, in
