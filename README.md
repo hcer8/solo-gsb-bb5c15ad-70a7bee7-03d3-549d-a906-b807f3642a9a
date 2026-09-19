@@ -3,7 +3,9 @@
 FastAPI 服务：接收 Intel HEX 文本，逐行校验（字节数 + 二补校验和），按地址组装固件映像，
 返回合并后的连续 Base64 段、段间空洞、入口地址与逐行诊断；并可针对一组命名内存区域
 做布局校验（覆盖率、data/entry 权限、区域占用率）、规划整体重定位，对比当前/目标两个
-映像规划 NOR Flash 的差分擦除/写入操作，按 Cortex-M 向量表语义校验映像中的向量表
+映像规划 NOR Flash 的差分擦除/写入操作，并可对一组**给定的有序 erase/write 操作序列**
+逐条回放 NOR Flash 状态、校验其合法性并确认最终映像与目标一致；还能按 Cortex-M 向量表
+语义校验映像中的向量表
 （初始栈顶、复位向量、Thumb 位与 ram/executable 区域归属），或将多个带唯一名称的
 Intel HEX 映像按绝对地址叠加合并（同值归并并记录全部来源、冲突按连续段报告、入口一致性校验）。
 
@@ -331,6 +333,115 @@ curl -s -X POST http://localhost:8000/api/v1/plan-flash-update \
   `write_count`/`write_bytes`（实际携带的写字节总量）、
   `changed_bytes` 与 `zero_to_one_bytes`。
 
+### `POST /api/v1/verify-flash-operations`
+
+擦/写操作序列回放校验：与 `/api/v1/plan-flash-update` 一样接收**当前映像 `current_hex`**、
+**目标映像 `target_hex`**、Flash 窗口（`flash_start`/`flash_end`）、`erase_block_size`、
+`max_write_size`，另外接收一个**有序 `operations` 数组**（`erase`/`write`，按数组顺序
+逐条回放）。该接口不生成方案，只回答两个问题：**操作序列本身是否合法**、**全部合法时
+回放结果是否与目标映像一致**。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/verify-flash-operations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "current_hex": ":10000000000102030405060708090A0B0C0D0E0F78\n:00000001FF\n",
+    "target_hex":  ":10000000FF0102030405060708090A0B0C0D0E0F79\n:00000001FF\n",
+    "flash_start": 0,
+    "flash_end": 256,
+    "erase_block_size": 64,
+    "max_write_size": 16,
+    "operations": [
+      {"kind": "erase", "address": 0,  "size": 64, "data_base64": null},
+      {"kind": "write", "address": 1,  "size": 15, "data_base64": "AQIDBAUGBwgJCgsMDQ4P"}
+    ]
+  }' | jq
+```
+
+前置校验与差分规划接口完全相同（复用同一解析器与参数校验）：任一 HEX 无效时只返回
+各自诊断（`params_valid` 为 `null`，不回放）；窗口/对齐参数不合法或映像越界时
+`params_valid=false`、`param_errors` 给出同样的错误码，不回放。
+
+逐条回放规则（在当前映像上维护 NOR Flash 状态，未定义字节按 `0xFF`）：
+
+- `erase`：`address` 必须对齐到 `erase_block_size`，`size` 必须是整块大小的**正整数倍**
+  （允许一次连续擦除多个整块），且整个区间位于 Flash 窗口内；执行后该区间字节全部变为
+  `0xFF`。
+- `write`：区间必须**完整位于 Flash 窗口内**；必须**完全落在单个擦除块内**
+  （不允许跨块）；`size` 不得超过 `max_write_size`；`data_base64` 必须可解码
+  且携带字节数恰为 `size`（erase 操作该字段为 `null`）；按位检查只能把比特
+  **`1 -> 0`**，任何 `0 -> 1`（如 `0x00 -> 0x01`）都非法——NOR 闪存只有先擦除才能
+  恢复为 1。
+- **首个非法操作即停止回放**：`illegal_index`/`error_code` 给出其下标（0 起）与错误码，
+  `operation_error` 含完整信息（消息、相关地址范围），`executed_count` 为此前已成功
+  执行的操作数，其后的操作不再执行、也不做目标比对。
+
+操作错误码：`unknown_operation_kind`（kind 非 erase/write）、`operation_outside_flash`
+（地址/长度非法或越出窗口或超出 32 位空间）、`erase_not_block_aligned`（擦除未整块对齐）、
+`write_crosses_block`（写入跨越擦除块边界）、`write_too_long`（超过 `max_write_size`）、
+`write_data_invalid`（write 缺少/无法解码 Base64 载荷）、`write_data_size_mismatch`
+（载荷长度与 `size` 不符）、`write_zero_to_one`（写入试图置位，需先擦除）。
+
+全部操作合法后，把**回放结果与目标映像逐字节比较**（任一侧未定义的地址均按 `0xFF`），
+将差异地址**合并为极大连续区间** `diffs[]`（`start` 含、`end` 不含），并汇总
+`diff_byte_count`。仅当差异为零时 `matches_target=true` 且 **`ok=true`**。
+
+上例（先擦除块 0，再把地址 1..15 写成目标字节；目标首字节为 `0xFF`，擦除后自然满足）
+响应：
+
+```json
+{
+  "ok": true,
+  "current_hex_ok": true,
+  "target_hex_ok": true,
+  "params_valid": true,
+  "operations_valid": true,
+  "matches_target": true,
+  "flash_start": 0,
+  "flash_end": 256,
+  "erase_block_size": 64,
+  "max_write_size": 16,
+  "error_count": 0,
+  "warning_count": 0,
+  "param_errors": [],
+  "operation_count": 2,
+  "executed_count": 2,
+  "illegal_index": null,
+  "error_code": null,
+  "operation_error": null,
+  "diffs": [],
+  "diff_byte_count": 0,
+  "current_diagnostics": [ ... ],
+  "target_diagnostics": [ ... ]
+}
+```
+
+操作全部合法但回放结果不等于目标时（示意：漏写了地址 1，地址 4..5 也不对，差异自动
+合并为连续区间）：
+
+```json
+{
+  "ok": false,
+  "params_valid": true,
+  "operations_valid": true,
+  "matches_target": false,
+  "illegal_index": null,
+  "error_code": null,
+  "operation_error": null,
+  "operation_count": 2,
+  "executed_count": 2,
+  "diffs": [
+    {"start": 1, "end": 2, "size": 1},
+    {"start": 4, "end": 6, "size": 2}
+  ],
+  "diff_byte_count": 3
+}
+```
+
+- 空操作序列合法：此时等价于直接比较当前映像与目标映像（未定义字节按 `0xFF`）。
+- `/api/v1/plan-flash-update` 返回的 `operations`（含 `address`/`size`/`data_base64`）
+  可直接作为本接口的 `operations` 提交，规划结果必然通过回放校验。
+
 ### `POST /api/v1/validate-vector-table`
 
 Cortex-M 向量表校验：复用 Intel HEX 解析器组装映像，从 `vector_table_start` 起按
@@ -513,6 +624,7 @@ app/
   layout.py       # 内存布局校验（区域定义检查、段切分、占用统计，纯逻辑）
   relocation.py   # 整体重定位规划（可行 delta 闭区间求交合并、选最小位移，纯逻辑）
   flash_update.py # Flash 差分烧写规划（逐块比较、擦除判定、run 合并与切分，纯逻辑）
+  flash_verify.py # 擦/写操作序列回放校验（逐条合法性、1->0 语义、目标差异合并，纯逻辑）
   vector_table.py # Cortex-M 向量表校验（小端读取、栈顶/复位/Thumb 位与区域归属，纯逻辑）
   image_merge.py  # 多映像按绝对地址叠加合并（同值归并、冲突段报告、入口一致性，纯逻辑）
 tests/
@@ -520,6 +632,7 @@ tests/
   test_validate_layout.py       # validate-layout 接口与布局逻辑
   test_plan_relocation.py       # plan-relocation 接口与重定位逻辑
   test_plan_flash_update.py     # plan-flash-update 接口与烧写规划逻辑
+  test_verify_flash_operations.py # verify-flash-operations 接口与回放校验逻辑
   test_validate_vector_table.py # validate-vector-table 接口与向量表校验逻辑
   test_merge_images.py          # merge-images 接口与多映像合并逻辑
 Dockerfile
